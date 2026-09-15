@@ -192,6 +192,8 @@ def main() -> None:
 
                 if ranking.empty:
                     st.info("Ningún titular tiene más de un trámite resuelto en este filtro — desmarca la casilla para ver todos.")
+                elif len(ranking) <= 4:
+                    st.dataframe(ranking, use_container_width=True)
                 else:
                     col_a, col_b = st.columns(2)
                     with col_a:
