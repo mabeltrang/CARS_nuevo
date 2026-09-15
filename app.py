@@ -46,9 +46,15 @@ def cargar_datos(contenido: bytes) -> pd.DataFrame:
             df[c] = pd.to_datetime(df[c], errors="coerce")
 
     df["Titular"] = df["Titular"].apply(normalizar_titular)
+    df["_titular_clave"] = df["Titular"].astype(str).apply(quitar_acentos).str.upper()
+    # colapsa siglas tipo "S.A.S", "E.S.P" quitándoles los puntos SIN dejar espacio
+    # (si no, "E.S.P" -> "E S P" y "ESP" -> "ESP" quedan como cosas distintas)
+    df["_titular_clave"] = df["_titular_clave"].str.replace(
+        r"\b(?:[A-Z]\.){1,}[A-Z]?\.?", lambda m: m.group(0).replace(".", ""), regex=True
+    )
     df["_titular_clave"] = (
-        df["Titular"].astype(str).apply(quitar_acentos).str.upper()
-        .str.replace(r"[.,]", " ", regex=True).str.replace(r"\s+", " ", regex=True).str.strip()
+        df["_titular_clave"].str.replace(r"[.,]", " ", regex=True)
+        .str.replace(r"\s+", " ", regex=True).str.strip()
     )
 
     df["dias_radicado_auto"] = (df["Fecha auto"] - df["Fecha radicado inicio trámite"]).dt.days
@@ -127,121 +133,122 @@ def main() -> None:
     if solo_empresas:
         base = base[base["Tipo de persona"] == "Empresa / Entidad"]
     limpio = base[~base["_anomalia"]]
+    comparable = limpio[limpio["dias_radicado_resolucion"].notna()]
 
     if base["_anomalia"].sum():
-        st.caption(f"({int(base['_anomalia'].sum())} trámite(s) con fechas inconsistentes se excluyen de los promedios)")
+        st.caption(f"⚠️ {int(base['_anomalia'].sum())} trámite(s) con fechas inconsistentes se excluyen de los promedios")
 
     unidad = st.segmented_control("Unidad", ["Días", "Meses"], default="Días", label_visibility="collapsed")
     unidad = unidad or "Días"
 
-    st.subheader(f"Tiempo promedio entre etapas ({unidad.lower()})")
-    prom = lambda c: formatear_dias(limpio[c].mean(), unidad) if limpio[c].notna().any() else "—"
-    fila_de_circulos([
-        (prom("dias_radicado_auto"), "Radicado → Auto", COLOR_PRIMARIO),
-        (prom("dias_auto_visita"), "Auto → Visita", COLOR_PRIMARIO),
-        (prom("dias_visita_resolucion"), "Visita → Resolución", COLOR_PRIMARIO),
-        (prom("dias_radicado_resolucion"), "Radicado → Resolución (total)", COLOR_ALERTA),
-    ])
+    # ---- Tarjeta 1: resumen general ----
+    with st.container(border=True):
+        st.subheader(f"Tiempo promedio entre etapas ({unidad.lower()})")
+        prom = lambda c: formatear_dias(limpio[c].mean(), unidad) if limpio[c].notna().any() else "—"
+        fila_de_circulos([
+            (prom("dias_radicado_auto"), "Radicado → Auto", COLOR_PRIMARIO),
+            (prom("dias_auto_visita"), "Auto → Visita", COLOR_PRIMARIO),
+            (prom("dias_visita_resolucion"), "Visita → Resolución", COLOR_PRIMARIO),
+            (prom("dias_radicado_resolucion"), "Radicado → Resolución (total)", COLOR_ALERTA),
+        ])
 
-    st.divider()
-
-    tab_modalidad, tab_ranking, tab_tendencia, tab_detalle = st.tabs(
-        ["Aislado vs. Único", "¿Quién sale más rápido?", "Tendencia", "Detalle"]
-    )
-
-    comparable = limpio[limpio["dias_radicado_resolucion"].notna()]
-
-    with tab_modalidad:
-        st.subheader("Radicado → Resolución, según modalidad de aprovechamiento")
         forestal = comparable[comparable["Categoría Trámite"] == "Aprovechamiento forestal"]
         forestal = forestal[forestal["Tipo de aprovechamiento"].notna()]
-        if forestal.empty:
-            st.info("No hay suficientes trámites forestales resueltos en este filtro.")
-        else:
+        if not forestal.empty:
+            st.divider()
+            st.markdown(f"**Según modalidad ({unidad.lower()})**")
             por_modalidad = forestal.groupby("Tipo de aprovechamiento")["dias_radicado_resolucion"].agg(["mean", "count"])
             items = [
                 (formatear_dias(fila["mean"], unidad), f"{modalidad} (n={int(fila['count'])})", COLOR_PRIMARIO)
                 for modalidad, fila in por_modalidad.iterrows()
             ]
             fila_de_circulos(items)
-            st.caption("Único (el trámite forestal completo) tarda bastante más que Aislado (árboles urbanos aislados) — tiene sentido por la complejidad, pero ayuda a poner expectativas.")
+            notas = ["Único (el trámite forestal completo) tarda bastante más que Aislado (árboles urbanos aislados)."]
+            num_arboles_valido = forestal[["num_arboles_num", "dias_radicado_resolucion"]].dropna()
+            if len(num_arboles_valido) >= 5:
+                correlacion = num_arboles_valido.corr().iloc[0, 1]
+                notas.append(f"A más árboles solicitados, más tarda el trámite (correlación de {correlacion:.2f} sobre {len(num_arboles_valido)} casos).")
+            st.caption(" ".join(notas))
 
-        num_arboles_valido = forestal[["num_arboles_num", "dias_radicado_resolucion"]].dropna()
-        if len(num_arboles_valido) >= 5:
-            correlacion = num_arboles_valido.corr().iloc[0, 1]
-            st.caption(f"A más árboles solicitados, más tarda el trámite (correlación de {correlacion:.2f} sobre {len(num_arboles_valido)} casos).")
+    tab_ranking, tab_tendencia, tab_detalle = st.tabs(["¿Quién sale más rápido?", "Tendencia", "Detalle"])
 
     with tab_ranking:
-        st.subheader("Radicado → Resolución, por titular (más rápido primero)")
-        if comparable.empty:
-            st.info("Todavía no hay trámites resueltos en este filtro.")
-        else:
-            solo_repetidos = st.checkbox("Mostrar solo titulares con más de un trámite resuelto")
-            col_unidad = f"{unidad} (radicado→resolución)"
-            ranking = (
-                comparable.groupby("_titular_clave")
-                .agg(Titular=("Titular", "first"), _dias=("dias_radicado_resolucion", "mean"),
-                     Casos=("dias_radicado_resolucion", "count"))
-            )
-            if solo_repetidos:
-                ranking = ranking[ranking["Casos"] > 1]
-            ranking[col_unidad] = ranking["_dias"].apply(lambda v: formatear_dias(v, unidad))
-            ranking = ranking.sort_values("_dias").set_index("Titular")[[col_unidad, "Casos"]]
-
-            if ranking.empty:
-                st.info("Ningún titular tiene más de un trámite resuelto en este filtro — desmarca la casilla para ver todos.")
+        with st.container(border=True):
+            st.subheader("Radicado → Resolución, por titular (más rápido primero)")
+            if comparable.empty:
+                st.info("Todavía no hay trámites resueltos en este filtro.")
             else:
-                col_a, col_b = st.columns(2)
-                with col_a:
-                    st.markdown("**Más rápidos**")
-                    st.dataframe(ranking.head(10), use_container_width=True)
-                with col_b:
-                    st.markdown("**Más lentos**")
-                    st.dataframe(ranking.tail(10).iloc[::-1], use_container_width=True)
-                if not solo_repetidos:
-                    st.caption("Cuando 'Casos' es 1, el valor es ese único trámite, no un promedio real — marca la casilla de arriba para comparar solo titulares con más de un caso.")
+                solo_repetidos = st.checkbox("Mostrar solo titulares con más de un trámite resuelto")
+                col_unidad = f"{unidad} (radicado→resolución)"
+                ranking = (
+                    comparable.groupby("_titular_clave")
+                    .agg(Titular=("Titular", "first"), _dias=("dias_radicado_resolucion", "mean"),
+                         Casos=("dias_radicado_resolucion", "count"))
+                )
+                if solo_repetidos:
+                    ranking = ranking[ranking["Casos"] > 1]
+                ranking[col_unidad] = ranking["_dias"].apply(lambda v: formatear_dias(v, unidad))
+                ranking = ranking.sort_values("_dias").set_index("Titular")[[col_unidad, "Casos"]]
 
-            fila_unergy = comparable[comparable["_titular_clave"].str.contains("UNERGY", na=False)]
-            resto = comparable[~comparable["_titular_clave"].str.contains("UNERGY", na=False)]
-            if not fila_unergy.empty:
-                fila_de_circulos([
-                    (formatear_dias(fila_unergy["dias_radicado_resolucion"].mean(), unidad), f"Unergy (n={len(fila_unergy)})", COLOR_ALERTA),
-                    (formatear_dias(resto["dias_radicado_resolucion"].mean(), unidad), f"Resto de titulares (n={len(resto)})", COLOR_PRIMARIO),
-                ])
+                if ranking.empty:
+                    st.info("Ningún titular tiene más de un trámite resuelto en este filtro — desmarca la casilla para ver todos.")
+                else:
+                    col_a, col_b = st.columns(2)
+                    with col_a:
+                        st.markdown("**Más rápidos**")
+                        st.dataframe(ranking.head(10), use_container_width=True)
+                    with col_b:
+                        st.markdown("**Más lentos**")
+                        st.dataframe(ranking.tail(10).iloc[::-1], use_container_width=True)
+                    if not solo_repetidos:
+                        st.caption("Cuando 'Casos' es 1, el valor es ese único trámite, no un promedio real — marca la casilla de arriba para comparar solo titulares con más de un caso.")
+
+                fila_unergy = comparable[comparable["_titular_clave"].str.contains("UNERGY", na=False)]
+                resto = comparable[~comparable["_titular_clave"].str.contains("UNERGY", na=False)]
+                if not fila_unergy.empty:
+                    st.divider()
+                    fila_de_circulos([
+                        (formatear_dias(fila_unergy["dias_radicado_resolucion"].mean(), unidad), f"Unergy (n={len(fila_unergy)})", COLOR_ALERTA),
+                        (formatear_dias(resto["dias_radicado_resolucion"].mean(), unidad), f"Resto de titulares (n={len(resto)})", COLOR_PRIMARIO),
+                    ])
 
     with tab_tendencia:
-        st.subheader(f"Radicado → Resolución, por trámite ({unidad.lower()})")
-        if comparable.empty:
-            st.info("Todavía no hay trámites resueltos en este filtro.")
-        else:
-            divisor = 30 if unidad == "Meses" else 1
-            datos_grafica = comparable[["Titular", "Fecha radicado inicio trámite", "dias_radicado_resolucion", "Categoría Trámite"]].copy()
-            datos_grafica["valor"] = datos_grafica["dias_radicado_resolucion"] / divisor
+        with st.container(border=True):
+            st.subheader(f"Radicado → Resolución, tendencia ({unidad.lower()})")
+            if len(comparable) < 3:
+                st.info("Todavía no hay suficientes trámites resueltos en este filtro para ver una tendencia.")
+            else:
+                divisor = 30 if unidad == "Meses" else 1
+                datos = comparable[["Fecha radicado inicio trámite", "dias_radicado_resolucion"]].copy()
+                datos = datos.sort_values("Fecha radicado inicio trámite")
+                datos["valor"] = datos["dias_radicado_resolucion"] / divisor
+                ventana = min(5, len(datos))
+                datos["promedio_movil"] = datos["valor"].rolling(ventana, min_periods=1).mean()
 
-            grafica = (
-                alt.Chart(datos_grafica)
-                .mark_circle(size=90, opacity=0.75)
-                .encode(
-                    x=alt.X("Fecha radicado inicio trámite:T", title=None, axis=alt.Axis(format="%b %Y", tickCount=6)),
-                    y=alt.Y("valor:Q", title=unidad),
-                    color=alt.Color("Categoría Trámite:N", legend=alt.Legend(title=None)) if len(cat_sel) > 1 else alt.value(COLOR_PRIMARIO),
-                    tooltip=["Titular", alt.Tooltip("Fecha radicado inicio trámite:T", format="%d %b %Y"), alt.Tooltip("valor:Q", title=unidad, format=".1f")],
+                grafica = (
+                    alt.Chart(datos)
+                    .mark_line(point=False, color=COLOR_PRIMARIO, strokeWidth=3)
+                    .encode(
+                        x=alt.X("Fecha radicado inicio trámite:T", title=None, axis=alt.Axis(format="%b %Y", tickCount=6)),
+                        y=alt.Y("promedio_movil:Q", title=unidad),
+                        tooltip=[alt.Tooltip("Fecha radicado inicio trámite:T", format="%d %b %Y"), alt.Tooltip("promedio_movil:Q", title=unidad, format=".1f")],
+                    )
+                    .properties(height=350)
                 )
-                .properties(height=380)
-            )
-            st.altair_chart(grafica, use_container_width=True)
-            st.caption("Cada punto es un trámite, ubicado en la fecha en que se radicó. Los de 2024 tardaban varios cientos de días; los más recientes se resuelven mucho más rápido.")
+                st.altair_chart(grafica, use_container_width=True)
+                st.caption(f"Promedio móvil de los últimos {ventana} trámites, ordenados por fecha de radicación. Los de 2024 tardaban varios cientos de días; los más recientes se resuelven mucho más rápido.")
 
     with tab_detalle:
-        columnas = [
-            "Archivo", "Titular", "Categoría Trámite", "Tipo de aprovechamiento", "Seccional",
-            "Fecha radicado inicio trámite", "Fecha resolución", "dias_radicado_resolucion", "Requerimientos",
-        ]
-        columnas = [c for c in columnas if c in base.columns]
-        st.dataframe(
-            base[columnas].sort_values("Fecha resolución", ascending=False),
-            use_container_width=True, hide_index=True,
-        )
+        with st.container(border=True):
+            columnas = [
+                "Archivo", "Titular", "Categoría Trámite", "Tipo de aprovechamiento", "Seccional",
+                "Fecha radicado inicio trámite", "Fecha resolución", "dias_radicado_resolucion", "Requerimientos",
+            ]
+            columnas = [c for c in columnas if c in base.columns]
+            st.dataframe(
+                base[columnas].sort_values("Fecha resolución", ascending=False),
+                use_container_width=True, hide_index=True,
+            )
 
 
 if __name__ == "__main__":
