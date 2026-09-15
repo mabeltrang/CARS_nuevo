@@ -11,6 +11,7 @@ import os
 import re
 import unicodedata
 
+import altair as alt
 import pandas as pd
 import streamlit as st
 
@@ -67,44 +68,31 @@ def cargar_datos(contenido: bytes) -> pd.DataFrame:
     return df
 
 
-def obtener_unidad() -> str:
-    return st.query_params.get("unidad", "dias")
-
-
-def _href_alternar_unidad() -> str:
-    return "?unidad=meses" if obtener_unidad() == "dias" else "?unidad=dias"
-
-
 def formatear_dias(valor: float | None, unidad: str) -> str:
     if valor is None or pd.isna(valor):
         return "—"
-    if unidad == "meses":
+    if unidad == "Meses":
         return f"{valor / 30:.1f}"
     return f"{valor:.0f}"
 
 
-def circulo(valor: str, etiqueta: str, color: str = COLOR_PRIMARIO, clicable: bool = False) -> str:
-    contenido = f"""
+def circulo(valor: str, etiqueta: str, color: str = COLOR_PRIMARIO) -> str:
+    return f"""
+    <div style="display:flex;flex-direction:column;align-items:center;gap:10px;padding:8px;">
       <div style="width:118px;height:118px;border-radius:50%;background:{color}18;
                   border:5px solid {color};display:flex;align-items:center;justify-content:center;">
         <span style="font-size:26px;font-weight:700;color:{color};">{valor}</span>
       </div>
       <div style="font-size:13px;text-align:center;color:#555;max-width:140px;line-height:1.3;">{etiqueta}</div>
-    """
-    envoltura_abre = f'<a href="{_href_alternar_unidad()}" target="_self" style="text-decoration:none;cursor:pointer;">' if clicable else ""
-    envoltura_cierra = "</a>" if clicable else ""
-    return f"""
-    <div style="display:flex;flex-direction:column;align-items:center;gap:10px;padding:8px;">
-      {envoltura_abre}{contenido}{envoltura_cierra}
     </div>
     """
 
 
-def fila_de_circulos(items: list[tuple[str, str, str]], clicable: bool = False) -> None:
+def fila_de_circulos(items: list[tuple[str, str, str]]) -> None:
     cols = st.columns(len(items))
     for col, (valor, etiqueta, color) in zip(cols, items):
         with col:
-            st.markdown(circulo(valor, etiqueta, color, clicable=clicable), unsafe_allow_html=True)
+            st.markdown(circulo(valor, etiqueta, color), unsafe_allow_html=True)
 
 
 def main() -> None:
@@ -143,16 +131,17 @@ def main() -> None:
     if base["_anomalia"].sum():
         st.caption(f"({int(base['_anomalia'].sum())} trámite(s) con fechas inconsistentes se excluyen de los promedios)")
 
-    unidad = obtener_unidad()
-    st.subheader(f"Tiempo promedio entre etapas ({'días' if unidad == 'dias' else 'meses'})")
-    st.caption("Haz clic en cualquier círculo para alternar entre días y meses.")
+    unidad = st.segmented_control("Unidad", ["Días", "Meses"], default="Días", label_visibility="collapsed")
+    unidad = unidad or "Días"
+
+    st.subheader(f"Tiempo promedio entre etapas ({unidad.lower()})")
     prom = lambda c: formatear_dias(limpio[c].mean(), unidad) if limpio[c].notna().any() else "—"
     fila_de_circulos([
         (prom("dias_radicado_auto"), "Radicado → Auto", COLOR_PRIMARIO),
         (prom("dias_auto_visita"), "Auto → Visita", COLOR_PRIMARIO),
         (prom("dias_visita_resolucion"), "Visita → Resolución", COLOR_PRIMARIO),
         (prom("dias_radicado_resolucion"), "Radicado → Resolución (total)", COLOR_ALERTA),
-    ], clicable=True)
+    ])
 
     st.divider()
 
@@ -171,7 +160,7 @@ def main() -> None:
         else:
             por_modalidad = forestal.groupby("Tipo de aprovechamiento")["dias_radicado_resolucion"].agg(["mean", "count"])
             items = [
-                (f"{fila['mean']:.0f}", f"{modalidad} (n={int(fila['count'])})", COLOR_PRIMARIO)
+                (formatear_dias(fila["mean"], unidad), f"{modalidad} (n={int(fila['count'])})", COLOR_PRIMARIO)
                 for modalidad, fila in por_modalidad.iterrows()
             ]
             fila_de_circulos(items)
@@ -187,41 +176,61 @@ def main() -> None:
         if comparable.empty:
             st.info("Todavía no hay trámites resueltos en este filtro.")
         else:
-            minimo_casos = st.slider("Mostrar solo titulares con al menos N trámites resueltos", 1, 5, 1)
+            solo_repetidos = st.checkbox("Mostrar solo titulares con más de un trámite resuelto")
+            col_unidad = f"{unidad} (radicado→resolución)"
             ranking = (
                 comparable.groupby("_titular_clave")
-                .agg(Titular=("Titular", "first"), Días=("dias_radicado_resolucion", "mean"),
+                .agg(Titular=("Titular", "first"), _dias=("dias_radicado_resolucion", "mean"),
                      Casos=("dias_radicado_resolucion", "count"))
-                .round(0)
             )
-            ranking = ranking[ranking["Casos"] >= minimo_casos].sort_values("Días")
-            ranking = ranking.set_index("Titular")[["Días", "Casos"]]
+            if solo_repetidos:
+                ranking = ranking[ranking["Casos"] > 1]
+            ranking[col_unidad] = ranking["_dias"].apply(lambda v: formatear_dias(v, unidad))
+            ranking = ranking.sort_values("_dias").set_index("Titular")[[col_unidad, "Casos"]]
 
-            col_a, col_b = st.columns(2)
-            with col_a:
-                st.markdown("**Más rápidos**")
-                st.dataframe(ranking.head(10), use_container_width=True)
-            with col_b:
-                st.markdown("**Más lentos**")
-                st.dataframe(ranking.tail(10).sort_values("Días", ascending=False), use_container_width=True)
-            st.caption("Cuando 'Casos' es 1, el número de 'Días' es ese único trámite, no un promedio real — súbelo con el control de arriba para ver solo titulares con más de un caso.")
+            if ranking.empty:
+                st.info("Ningún titular tiene más de un trámite resuelto en este filtro — desmarca la casilla para ver todos.")
+            else:
+                col_a, col_b = st.columns(2)
+                with col_a:
+                    st.markdown("**Más rápidos**")
+                    st.dataframe(ranking.head(10), use_container_width=True)
+                with col_b:
+                    st.markdown("**Más lentos**")
+                    st.dataframe(ranking.tail(10).iloc[::-1], use_container_width=True)
+                if not solo_repetidos:
+                    st.caption("Cuando 'Casos' es 1, el valor es ese único trámite, no un promedio real — marca la casilla de arriba para comparar solo titulares con más de un caso.")
 
-            fila_unergy = ranking[ranking.index.str.contains("UNERGY", case=False, na=False)]
+            fila_unergy = comparable[comparable["_titular_clave"].str.contains("UNERGY", na=False)]
+            resto = comparable[~comparable["_titular_clave"].str.contains("UNERGY", na=False)]
             if not fila_unergy.empty:
-                resto = ranking[~ranking.index.isin(fila_unergy.index)]
                 fila_de_circulos([
-                    (f"{fila_unergy['Días'].mean():.0f}", f"Unergy (n={int(fila_unergy['Casos'].sum())})", COLOR_ALERTA),
-                    (f"{resto['Días'].mean():.0f}", f"Resto de titulares (n={len(resto)})", COLOR_PRIMARIO),
+                    (formatear_dias(fila_unergy["dias_radicado_resolucion"].mean(), unidad), f"Unergy (n={len(fila_unergy)})", COLOR_ALERTA),
+                    (formatear_dias(resto["dias_radicado_resolucion"].mean(), unidad), f"Resto de titulares (n={len(resto)})", COLOR_PRIMARIO),
                 ])
 
     with tab_tendencia:
-        st.subheader("Radicado → Resolución, por mes de radicación")
+        st.subheader(f"Radicado → Resolución, por trámite ({unidad.lower()})")
         if comparable.empty:
             st.info("Todavía no hay trámites resueltos en este filtro.")
         else:
-            tendencia = comparable.groupby("mes_radicado")["dias_radicado_resolucion"].mean().sort_index()
-            st.line_chart(tendencia)
-            st.caption("Los trámites radicados en 2024 tardaban varios cientos de días; los más recientes se están resolviendo mucho más rápido.")
+            divisor = 30 if unidad == "Meses" else 1
+            datos_grafica = comparable[["Titular", "Fecha radicado inicio trámite", "dias_radicado_resolucion", "Categoría Trámite"]].copy()
+            datos_grafica["valor"] = datos_grafica["dias_radicado_resolucion"] / divisor
+
+            grafica = (
+                alt.Chart(datos_grafica)
+                .mark_circle(size=90, opacity=0.75)
+                .encode(
+                    x=alt.X("Fecha radicado inicio trámite:T", title=None, axis=alt.Axis(format="%b %Y", tickCount=6)),
+                    y=alt.Y("valor:Q", title=unidad),
+                    color=alt.Color("Categoría Trámite:N", legend=alt.Legend(title=None)) if len(cat_sel) > 1 else alt.value(COLOR_PRIMARIO),
+                    tooltip=["Titular", alt.Tooltip("Fecha radicado inicio trámite:T", format="%d %b %Y"), alt.Tooltip("valor:Q", title=unidad, format=".1f")],
+                )
+                .properties(height=380)
+            )
+            st.altair_chart(grafica, use_container_width=True)
+            st.caption("Cada punto es un trámite, ubicado en la fecha en que se radicó. Los de 2024 tardaban varios cientos de días; los más recientes se resuelven mucho más rápido.")
 
     with tab_detalle:
         columnas = [
