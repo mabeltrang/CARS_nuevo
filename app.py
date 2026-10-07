@@ -382,6 +382,107 @@ def selector_car(cars: list[str]) -> str:
     return st.session_state["car_sel"]
 
 
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
+def _boletines_corpocesar(anios: tuple[int, ...]) -> tuple[list[dict], list[str]]:
+    import corpocesar_web as web
+    actos, errores = [], []
+    for anio in anios:
+        try:
+            paginas = web.paginas_del_anio(anio)
+        except Exception as e:
+            errores.append(f"Índice {anio}: {e.__class__.__name__}")
+            continue
+        for url, etiqueta in paginas:
+            try:
+                actos += web.leer_pagina(url, f"{etiqueta} {anio}")
+            except Exception as e:
+                errores.append(f"{etiqueta} {anio}: {e.__class__.__name__}")
+    return actos, errores
+
+
+@st.cache_data(ttl=7 * 24 * 3600, show_spinner=False)
+def _leer_pdf_corpocesar(url: str) -> dict:
+    import corpocesar_web as web
+    try:
+        return web.leer_pdf(url)
+    except Exception as e:
+        return {"Error": e.__class__.__name__}
+
+
+def _nucleo_nombre(titular: str) -> str:
+    """'PARQUE SOLAR EL UNIÓN S.A.S E.S.P' → 'PARQUE SOLAR EL UNION' (para buscar en el boletín)."""
+    n = quitar_acentos(str(titular)).upper()
+    n = re.sub(r"\b(S\.?\s?A\.?\s?S\.?|S\.?\s?A\.?|E\.?\s?S\.?\s?P\.?|LTDA\.?|S\.?C\.?A\.?|SAS|ESP)\b", " ", n)
+    return re.sub(r"[^A-Z0-9 ]", " ", re.sub(r"\s+", " ", n)).strip()
+
+
+def seccion_buscar_en_car(car: str, limpio: pd.DataFrame) -> None:
+    """Busca en la página de la CAR los actos de las empresas que más rápido salieron."""
+    with st.container(border=True):
+        st.subheader("¿Qué hicieron distinto los que salieron más rápido?")
+        if car != "CORPOCESAR":
+            st.info(f"Por ahora la búsqueda en línea funciona solo con CORPOCESAR. {car} publica un único PDF "
+                    "mensual de miles de páginas: para esa CAR usa el script de boletines y sube el resultado al Excel.")
+            return
+        resueltos = limpio[limpio["dias_radicado_resolucion"].notna() & (limpio["Tipo de persona"] == "Empresa / Entidad")
+                           & ~limpio["es_publica"]]
+        ranking = (resueltos.groupby("Titular")["dias_radicado_resolucion"].mean().sort_values())
+        sugeridas = list(ranking.index[:3])
+        unergy = [t for t in ranking.index if "UNERGY" in quitar_acentos(t).upper()]
+        st.caption("Elige empresas (por defecto, las 3 más rápidas y Unergy). La app busca sus actos en los "
+                   "boletines de corpocesar.gov.co —Valledupar y seccionales— y lee los PDF para comparar "
+                   "fechas y si les pidieron información adicional.")
+        c1, c2 = st.columns([3, 1])
+        empresas = c1.multiselect("Empresas", list(ranking.index) + sorted(set(limpio["Titular"].dropna()) - set(ranking.index)),
+                                  default=sugeridas + [u for u in unergy if u not in sugeridas])
+        hoy = pd.Timestamp.today().year
+        anios = c2.multiselect("Años", list(range(2024, hoy + 1)), default=[hoy - 1, hoy])
+        if not empresas or not anios:
+            return
+        if not st.button("🔎 Buscar en corpocesar.gov.co", type="primary"):
+            st.caption("La primera búsqueda tarda 1–2 minutos (lee todos los boletines del año); después queda guardada 24 h.")
+            return
+        with st.spinner("Leyendo boletines de CORPOCESAR..."):
+            actos, errores = _boletines_corpocesar(tuple(sorted(anios)))
+        if errores:
+            st.caption("No se pudieron leer: " + "; ".join(errores[:6]))
+        claves = {e: _nucleo_nombre(e) for e in empresas}
+        filas = []
+        for a in actos:
+            desc = quitar_acentos(a["Descripción"]).upper()
+            desc = re.sub(r"[^A-Z0-9 ]", " ", desc)
+            for empresa, clave in claves.items():
+                if clave and clave in re.sub(r"\s+", " ", desc):
+                    filas.append({"Empresa": empresa, **a})
+        if not filas:
+            st.warning("No encontré actos de esas empresas en los boletines de esos años.")
+            return
+        hallados = pd.DataFrame(filas).drop_duplicates(subset=["Empresa", "PDF", "Número"]).sort_values(["Empresa", "Fecha"])
+        st.success(f"{len(hallados)} actos encontrados de {hallados['Empresa'].nunique()} empresas.")
+        st.dataframe(hallados[["Empresa", "Fecha", "Categoría", "Descripción", "PDF"]], hide_index=True, width="stretch",
+                     column_config={"PDF": st.column_config.LinkColumn("PDF", display_text="Abrir")})
+
+        resoluciones = hallados[hallados["PDF"].str.contains("RESOL", case=False, na=False)]
+        if resoluciones.empty:
+            return
+        st.markdown("**Lo que dicen las resoluciones**")
+        with st.spinner(f"Leyendo {min(len(resoluciones), 20)} resoluciones..."):
+            leidas = [{"Empresa": r["Empresa"], "Resolución": r["Fecha"], **_leer_pdf_corpocesar(r["PDF"]), "PDF": r["PDF"]}
+                      for _, r in resoluciones.head(20).iterrows()]
+        tabla = pd.DataFrame(leidas)
+        for c in ["Radicado", "Auto de inicio", "Visita", "Resolución"]:
+            if c in tabla:
+                tabla[c] = pd.to_datetime(tabla[c], errors="coerce")
+        if {"Radicado", "Resolución"} <= set(tabla.columns):
+            tabla["Días radicado→resolución"] = (tabla["Resolución"] - tabla["Radicado"]).dt.days
+        if {"Auto de inicio", "Visita"} <= set(tabla.columns):
+            tabla["Días auto→visita"] = (tabla["Visita"] - tabla["Auto de inicio"]).dt.days
+        st.dataframe(tabla, hide_index=True, width="stretch",
+                     column_config={"PDF": st.column_config.LinkColumn("PDF", display_text="Abrir")})
+        st.caption("Compara sobre todo la columna de información adicional: un requerimiento suele sumar meses. "
+                   "Abre los PDF de las más rápidas para ver qué entregaron desde el radicado.")
+
+
 def main() -> None:
     col_logo, col_titulo = st.columns([1, 6])
     logo, titulo = col_logo.empty(), col_titulo.empty()
@@ -464,9 +565,12 @@ def main() -> None:
                 notas.append(f"A más árboles solicitados, más tarda el trámite (correlación de {correlacion:.2f} sobre {len(num_arboles_valido)} casos).")
             st.caption(" ".join(notas))
 
-    tab_pares, tab_ranking, tab_tendencia, tab_detalle = st.tabs(
-        ["Unergy vs. pares", "Ranking de titulares", "Tendencia", "Detalle"]
+    tab_pares, tab_buscar, tab_ranking, tab_tendencia, tab_detalle = st.tabs(
+        ["Unergy vs. pares", "Buscar en la CAR", "Ranking de titulares", "Tendencia", "Detalle"]
     )
+
+    with tab_buscar:
+        seccion_buscar_en_car(car_sel, limpio)
 
     with tab_pares:
         # personas naturales como referencia, aunque el filtro "Solo empresas" esté activo
