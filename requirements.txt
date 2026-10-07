@@ -2,3 +2,6 @@ streamlit
 pandas
 openpyxl
 altair
+requests
+beautifulsoup4
+pymupdf
