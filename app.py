@@ -68,8 +68,17 @@ def cargar_datos(contenido: bytes) -> pd.DataFrame:
         df["_anomalia"] |= df[c] < 0
 
     df["es_unergy"] = df["_titular_clave"].str.contains("UNERGY", na=False)
+    clave = df["_titular_clave"].fillna("")
+    df["es_esp"] = clave.str.contains(r"\bESP\b", regex=True)
+    df["es_energia"] = df["es_esp"] | clave.str.contains(r"SOLAR|ENERG|RENOVABL|ELECTRI", regex=True)
+    df["es_publica"] = clave.str.contains(
+        r"ALCALD|MUNICIPIO|GOBERNACION|DEPARTAMENTO|SECRETARI|^ESE |HOSPITAL|UNIVERSIDAD|JUNTA DE ACCION", regex=True
+    )
     df["mes_radicado"] = df["Fecha radicado inicio trámite"].dt.to_period("M").astype(str)
     df["num_arboles_num"] = pd.to_numeric(df["# Arboles"], errors="coerce")
+    for c in ("# Arboles", "Vol (m3)"):
+        if c in df.columns:
+            df[c] = df[c].astype("string")
 
     return df
 
@@ -99,6 +108,131 @@ def fila_de_circulos(items: list[tuple[str, str, str]]) -> None:
     for col, (valor, etiqueta, color) in zip(cols, items):
         with col:
             st.markdown(circulo(valor, etiqueta, color), unsafe_allow_html=True)
+
+
+GRUPOS_PARES = {
+    "Empresas de servicios públicos (ESP)": "es_esp",
+    "Sector energía (ESP + solares / energía)": "es_energia",
+    "Todas las empresas privadas": None,
+}
+
+
+def seccion_pares(limpio: pd.DataFrame, unidad: str) -> None:
+    """Compara a Unergy contra un grupo de pares, con la misma modalidad de trámite."""
+    divisor = 30 if unidad == "Meses" else 1
+    empresas = limpio[(limpio["Tipo de persona"] == "Empresa / Entidad") & ~limpio["es_publica"]]
+
+    with st.container(border=True):
+        st.subheader("¿Cuánto se demora Unergy frente a empresas como nosotros?")
+        c1, c2 = st.columns([3, 2])
+        with c1:
+            grupo = st.radio("Comparar contra", list(GRUPOS_PARES), horizontal=True)
+        unergy = empresas[empresas["es_unergy"]]
+        modalidades_unergy = sorted(unergy["Tipo de aprovechamiento"].dropna().unique())
+        with c2:
+            misma_modalidad = st.checkbox(
+                f"Solo la misma modalidad de Unergy ({', '.join(modalidades_unergy) or '—'})",
+                value=bool(modalidades_unergy),
+                help="Un aprovechamiento Único tarda mucho más que uno Aislado: compararlos juntos no es justo.",
+            )
+
+        col_grupo = GRUPOS_PARES[grupo]
+        pares = empresas[~empresas["es_unergy"]]
+        if col_grupo:
+            pares = pares[pares[col_grupo]]
+        if misma_modalidad and modalidades_unergy:
+            pares = pares[pares["Tipo de aprovechamiento"].isin(modalidades_unergy)]
+            unergy = unergy[unergy["Tipo de aprovechamiento"].isin(modalidades_unergy)]
+
+        res_u = unergy[unergy["dias_radicado_resolucion"].notna()]
+        res_p = pares[pares["dias_radicado_resolucion"].notna()]
+        if res_u.empty or res_p.empty:
+            st.info("No hay trámites resueltos suficientes en este grupo. Prueba con un grupo más amplio "
+                    "o desmarca 'misma modalidad'.")
+            return
+
+        # --- Resumen ---
+        prom_u, prom_p = res_u["dias_radicado_resolucion"].mean(), res_p["dias_radicado_resolucion"].mean()
+        med_u, med_p = res_u["dias_radicado_resolucion"].median(), res_p["dias_radicado_resolucion"].median()
+        diferencia = prom_u - prom_p
+        color_u = COLOR_ALERTA if diferencia > 0 else COLOR_PRIMARIO
+        fila_de_circulos([
+            (formatear_dias(prom_u, unidad), f"Unergy — promedio (n={len(res_u)})", color_u),
+            (formatear_dias(prom_p, unidad), f"Pares — promedio (n={len(res_p)}, {res_p['_titular_clave'].nunique()} empresas)", COLOR_PRIMARIO),
+            (formatear_dias(med_u, unidad), "Unergy — mediana", color_u),
+            (formatear_dias(med_p, unidad), "Pares — mediana", COLOR_PRIMARIO),
+        ])
+        signo = "más" if diferencia > 0 else "menos"
+        st.markdown(
+            f"De radicado a resolución, Unergy tarda en promedio **{formatear_dias(abs(diferencia), unidad)} "
+            f"{unidad.lower()} {signo}** que el grupo *{grupo.lower()}*."
+        )
+        if len(res_p) < 5:
+            st.caption(f"⚠️ El grupo de pares tiene solo {len(res_p)} trámites resueltos: tómalo como referencia, no como promedio firme.")
+
+        # --- Por empresa ---
+        st.divider()
+        st.markdown(f"**Radicado → Resolución por empresa ({unidad.lower()})**")
+        comp = pd.concat([res_u, res_p])
+        comp = comp.assign(
+            Empresa=comp["Titular"],
+            valor=comp["dias_radicado_resolucion"] / divisor,
+            Grupo=comp["es_unergy"].map({True: "Unergy", False: "Pares"}),
+        )
+        por_empresa = (
+            comp.groupby(["Empresa", "Grupo"], as_index=False)
+            .agg(promedio=("valor", "mean"), casos=("valor", "count"))
+            .sort_values("promedio")
+        )
+        orden = por_empresa["Empresa"].tolist()
+        escala = alt.Scale(domain=["Unergy", "Pares"], range=[COLOR_ALERTA, "#94a3b8"])
+        barras = alt.Chart(por_empresa).mark_bar(cornerRadiusEnd=4, height=18).encode(
+            y=alt.Y("Empresa:N", sort=orden, title=None, axis=alt.Axis(labelLimit=320)),
+            x=alt.X("promedio:Q", title=unidad),
+            color=alt.Color("Grupo:N", scale=escala, legend=alt.Legend(orient="top", title=None)),
+            tooltip=["Empresa", alt.Tooltip("promedio:Q", title=f"Promedio ({unidad.lower()})", format=".0f"), "casos"],
+        )
+        puntos = alt.Chart(comp).mark_circle(size=55, color="#111", opacity=0.55).encode(
+            y=alt.Y("Empresa:N", sort=orden), x="valor:Q",
+            tooltip=["Archivo", "Tipo de aprovechamiento", alt.Tooltip("valor:Q", title=unidad, format=".0f")],
+        )
+        st.altair_chart((barras + puntos).properties(height=max(160, 34 * len(orden))), width="stretch")
+        st.caption("Barra = promedio de la empresa; cada punto negro es un trámite. Pasa el cursor para ver el archivo.")
+
+        # --- Por etapa: dónde se pierde el tiempo ---
+        st.divider()
+        st.markdown(f"**¿En qué etapa se va el tiempo? ({unidad.lower()} promedio)**")
+        etapas = {"dias_radicado_auto": "1. Radicado → Auto", "dias_auto_visita": "2. Auto → Visita",
+                  "dias_visita_resolucion": "3. Visita → Resolución"}
+        filas = []
+        for nombre, datos in (("Unergy", unergy), ("Pares", pares)):
+            for col, etiqueta in etapas.items():
+                serie = datos[col].dropna()
+                if len(serie):
+                    filas.append({"Grupo": nombre, "Etapa": etiqueta, "valor": serie.mean() / divisor, "n": len(serie)})
+        if filas:
+            df_etapas = pd.DataFrame(filas)
+            graf = alt.Chart(df_etapas).mark_bar(cornerRadiusEnd=4).encode(
+                y=alt.Y("Grupo:N", title=None, sort=["Unergy", "Pares"]),
+                x=alt.X("valor:Q", title=unidad),
+                color=alt.Color("Grupo:N", scale=escala, legend=None),
+                row=alt.Row("Etapa:N", title=None, header=alt.Header(labelAngle=0, labelAlign="left")),
+                tooltip=["Grupo", "Etapa", alt.Tooltip("valor:Q", format=".0f", title=unidad), "n"],
+            ).properties(height=60)
+            st.altair_chart(graf, width="stretch")
+            st.caption("Cada etapa usa los trámites que tienen esas dos fechas, aunque no estén resueltos todavía.")
+
+        # --- Trámites de pares en curso ---
+        en_curso = pares[pares["Fecha resolución"].isna() & pares["Fecha radicado inicio trámite"].notna()]
+        if not en_curso.empty:
+            with st.expander(f"Trámites de pares todavía sin resolución ({len(en_curso)})"):
+                hoy = pd.Timestamp.today().normalize()
+                tabla = en_curso.assign(
+                    **{f"{unidad} desde radicado": ((hoy - en_curso["Fecha radicado inicio trámite"]).dt.days / divisor).round(0)}
+                )[["Titular", "Tipo de aprovechamiento", "Fecha radicado inicio trámite", "Fecha auto",
+                   f"{unidad} desde radicado", "Archivo"]]
+                st.dataframe(tabla.sort_values(f"{unidad} desde radicado", ascending=False),
+                             width="stretch", hide_index=True)
 
 
 def main() -> None:
@@ -170,7 +304,12 @@ def main() -> None:
                 notas.append(f"A más árboles solicitados, más tarda el trámite (correlación de {correlacion:.2f} sobre {len(num_arboles_valido)} casos).")
             st.caption(" ".join(notas))
 
-    tab_ranking, tab_tendencia, tab_detalle = st.tabs(["¿Quién sale más rápido?", "Tendencia", "Detalle"])
+    tab_pares, tab_ranking, tab_tendencia, tab_detalle = st.tabs(
+        ["Unergy vs. pares", "Ranking de titulares", "Tendencia", "Detalle"]
+    )
+
+    with tab_pares:
+        seccion_pares(limpio, unidad)
 
     with tab_ranking:
         with st.container(border=True):
@@ -189,30 +328,12 @@ def main() -> None:
                     ranking = ranking[ranking["Casos"] > 1]
                 ranking[col_unidad] = ranking["_dias"].apply(lambda v: formatear_dias(v, unidad))
                 ranking = ranking.sort_values("_dias").set_index("Titular")[[col_unidad, "Casos"]]
-
                 if ranking.empty:
-                    st.info("Ningún titular tiene más de un trámite resuelto en este filtro — desmarca la casilla para ver todos.")
-                elif len(ranking) <= 4:
-                    st.dataframe(ranking, use_container_width=True)
+                    st.info("Ningún titular tiene más de un trámite resuelto en este filtro.")
                 else:
-                    col_a, col_b = st.columns(2)
-                    with col_a:
-                        st.markdown("**Más rápidos**")
-                        st.dataframe(ranking.head(10), use_container_width=True)
-                    with col_b:
-                        st.markdown("**Más lentos**")
-                        st.dataframe(ranking.tail(10).iloc[::-1], use_container_width=True)
+                    st.dataframe(ranking, width="stretch")
                     if not solo_repetidos:
-                        st.caption("Cuando 'Casos' es 1, el valor es ese único trámite, no un promedio real — marca la casilla de arriba para comparar solo titulares con más de un caso.")
-
-                fila_unergy = comparable[comparable["_titular_clave"].str.contains("UNERGY", na=False)]
-                resto = comparable[~comparable["_titular_clave"].str.contains("UNERGY", na=False)]
-                if not fila_unergy.empty:
-                    st.divider()
-                    fila_de_circulos([
-                        (formatear_dias(fila_unergy["dias_radicado_resolucion"].mean(), unidad), f"Unergy (n={len(fila_unergy)})", COLOR_ALERTA),
-                        (formatear_dias(resto["dias_radicado_resolucion"].mean(), unidad), f"Resto de titulares (n={len(resto)})", COLOR_PRIMARIO),
-                    ])
+                        st.caption("Cuando 'Casos' es 1, el valor es ese único trámite, no un promedio.")
 
     with tab_tendencia:
         with st.container(border=True):
@@ -237,7 +358,7 @@ def main() -> None:
                     )
                     .properties(height=350)
                 )
-                st.altair_chart(grafica, use_container_width=True)
+                st.altair_chart(grafica, width="stretch")
                 st.caption(f"Promedio móvil de los últimos {ventana} trámites, ordenados por fecha de radicación. Los de 2024 tardaban varios cientos de días; los más recientes se resuelven mucho más rápido.")
 
     with tab_detalle:
@@ -249,7 +370,7 @@ def main() -> None:
             columnas = [c for c in columnas if c in base.columns]
             st.dataframe(
                 base[columnas].sort_values("Fecha resolución", ascending=False),
-                use_container_width=True, hide_index=True,
+                width="stretch", hide_index=True,
             )
 
 
