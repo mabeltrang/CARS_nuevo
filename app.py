@@ -22,6 +22,9 @@ COLUMNAS_FECHA = ["Fecha radicado inicio trámite", "Fecha auto", "Fecha visita"
 
 COLOR_PRIMARIO = "#0F9D58"  # placeholder tipo "energía limpia" — cámbialo aquí si tienes el verde/azul oficial de Unergy
 COLOR_ALERTA = "#dc2626"
+# nombre con tilde para mostrar, según cómo venga escrito en el Excel (sin tildes, en mayúscula)
+NOMBRES_CAR = {"CORPOBOYACA": "CORPOBOYACÁ", "CARSUCRE": "CARSUCRE", "CORPOCESAR": "CORPOCESAR"}
+LOGOS_CAR = {"CORPOCESAR": "https://www.corpocesar.gov.co/images/LogoCorpocesar%20SIN%20FONDO.png"}
 LOGO_CORPOCESAR = "https://www.corpocesar.gov.co/images/LogoCorpocesar%20SIN%20FONDO.png"
 
 
@@ -48,8 +51,27 @@ def unir_actos_en_tramites(df: pd.DataFrame) -> pd.DataFrame:
     varios proyectos a la vez y el Excel no trae el número de expediente).
     """
     df = df.copy()
+    # Si la columna "Archivo" trae el número de expediente (CORPOBOYACÁ: AFAA-00034-26),
+    # todos los actos de ese expediente son un solo trámite: se unen por ahí.
+    exp = df["Archivo"].astype(str).str.upper().str.replace(r"[^A-Z0-9]", "", regex=True)
+    es_exp = df["Archivo"].notna() & ~df["Archivo"].astype(str).str.lower().str.endswith(".pdf") & \
+        exp.str.match(r"^[A-Z]{2,6}\d{3,}")
+    df["_expediente"] = (df["CAR"] + "|" + exp).where(es_exp)
+    if es_exp.any():
+        con_exp = df[es_exp]
+        agg = {c: "first" for c in con_exp.columns if c != "_expediente"}
+        agg.update({c: "min" for c in COLUMNAS_FECHA if c in con_exp.columns})
+        agg["Tipo"] = lambda s: " + ".join(sorted(set(s.dropna().astype(str))))
+        con_exp = con_exp.groupby("_expediente", as_index=False).agg(agg)
+        df = pd.concat([df[~es_exp], con_exp], ignore_index=True)
+    # titular genérico ("Persona natural", "Alcaldía", vacío): no se puede saber si dos filas
+    # son el mismo trámite, así que cada fila cuenta sola
+    generico = df["_titular_clave"].isin(["PERSONA NATURAL", "ALCALDIA", "NAN", ""]) | df["_titular_clave"].isna()
+    df["_unico"] = ""
+    df.loc[generico | df["_expediente"].notna(), "_unico"] = [f"f{i}" for i in range(int((generico | df["_expediente"].notna()).sum()))]
     fechas = [c for c in COLUMNAS_FECHA if c in df.columns]
-    df["_k_tit"] = df["_titular_clave"].fillna("") + "|" + df["Categoría Trámite"].fillna("")
+    df["_k_tit"] = (df["CAR"] + "|" + df["_titular_clave"].fillna("") + "|" + df["Categoría Trámite"].fillna("")
+                    + "|" + df["_unico"])
     clave_completa = ["_k_tit"] + fechas
     archivos = (df.assign(_a=df["Archivo"].fillna("").astype(str))
                 .groupby(clave_completa, dropna=False)["_a"]
@@ -86,6 +108,11 @@ def cargar_datos(contenido: bytes) -> pd.DataFrame:
         if c in df.columns:
             df[c] = pd.to_datetime(df[c], errors="coerce")
 
+    if "CAR" not in df.columns:
+        df["CAR"] = "CORPOCESAR"
+    car = df["CAR"].fillna("CORPOCESAR").astype(str).apply(quitar_acentos).str.upper().str.strip()
+    df["CAR"] = car.map(lambda c: NOMBRES_CAR.get(c, c))
+
     df["Titular"] = df["Titular"].apply(normalizar_titular)
     df["_titular_clave"] = df["Titular"].astype(str).apply(quitar_acentos).str.upper()
     # colapsa siglas tipo "S.A.S", "E.S.P" quitándoles los puntos SIN dejar espacio
@@ -109,6 +136,8 @@ def cargar_datos(contenido: bytes) -> pd.DataFrame:
     df["_anomalia"] = False
     for c in intervalos:
         df["_anomalia"] |= df[c] < 0
+    # auto posterior a la resolución (la visita puede faltar, así que se revisa aparte)
+    df["_anomalia"] |= (df["Fecha resolución"] - df["Fecha auto"]).dt.days < 0
 
     df["es_unergy"] = df["_titular_clave"].str.contains("UNERGY", na=False)
     clave = df["_titular_clave"].fillna("")
@@ -315,10 +344,7 @@ def seccion_pares(limpio: pd.DataFrame, unidad: str, personas: pd.DataFrame | No
 
 def main() -> None:
     col_logo, col_titulo = st.columns([1, 6])
-    with col_logo:
-        st.image(LOGO_CORPOCESAR, width=90)
-    with col_titulo:
-        st.title("Tiempos de trámite — CORPOCESAR")
+    logo, titulo = col_logo.empty(), col_titulo.empty()
 
     archivo = st.sidebar.file_uploader("Reemplazar el Excel del repo (opcional)", type=["xlsx"])
     if archivo:
@@ -334,12 +360,19 @@ def main() -> None:
         return
 
     df = cargar_datos(contenido)
+    cars = sorted(df["CAR"].dropna().unique(), key=lambda c: (c != "CORPOCESAR", c))
 
     with st.sidebar:
         st.header("Filtros")
+        car_sel = st.radio("CAR", cars, horizontal=False) if len(cars) > 1 else cars[0]
         solo_empresas = st.checkbox("Solo empresas / entidades", value=True)
         categorias_validas = ["Aprovechamiento forestal", "Ocupación de cauce"]
         cat_sel = [c for c in categorias_validas if st.checkbox(c, value=True)]
+
+    df = df[df["CAR"] == car_sel]
+    titulo.title(f"Tiempos de trámite — {car_sel}")
+    if LOGOS_CAR.get(car_sel):
+        logo.image(LOGOS_CAR[car_sel], width=90)
 
     base = df[df["Categoría Trámite"].isin(cat_sel)]
     if solo_empresas:
