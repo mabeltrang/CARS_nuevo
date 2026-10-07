@@ -190,24 +190,35 @@ def seccion_pares(limpio: pd.DataFrame, unidad: str) -> None:
         res_e = res_p[res_p["es_energia"]]
 
         # --- Resumen (aprovechamiento forestal, que es el trámite de Unergy) ---
-        dias = lambda d: formatear_dias(d["dias_radicado_resolucion"].mean(), unidad) if len(d) else "—"
+        def circulo_de(d, nombre, color):
+            if not len(d):
+                return ("—", nombre, color)
+            auto = d["dias_radicado_auto"].mean()
+            total = d["dias_radicado_resolucion"].mean()
+            desglose = (f"<br><span style='font-size:12px'>{formatear_dias(auto, unidad)} hasta el auto + "
+                        f"{formatear_dias(total - auto, unidad)} hasta la resolución</span>") if pd.notna(auto) else ""
+            return (formatear_dias(total, unidad), f"{nombre} (n={len(d)}){desglose}", color)
         fila_de_circulos([
-            (dias(res_u), f"Unergy (n={len(res_u)})", COLOR_ALERTA),
-            (dias(res_e), f"Empresas de energía (n={len(res_e)})", "#475569"),
-            (dias(res_p), f"Todas las empresas privadas (n={len(res_p)})", "#94a3b8"),
+            circulo_de(res_u, "Unergy", COLOR_ALERTA),
+            circulo_de(res_e, "Empresas de energía", "#475569"),
+            circulo_de(res_p, "Todas las empresas privadas", "#94a3b8"),
         ])
-        st.caption(f"Aprovechamiento forestal: promedio de {unidad.lower()} entre el radicado y la resolución. "
-                   "n = número de trámites resueltos.")
+        st.caption(f"Aprovechamiento forestal: {unidad.lower()} promedio de radicado a resolución, "
+                   "y cuánto de eso fue hasta el auto de inicio. n = trámites resueltos.")
 
-        # --- Por empresa, forestal y cauce en el mismo gráfico ---
+        # --- Por empresa: barra partida en radicado→auto y auto→resolución ---
         st.divider()
-        st.markdown(f"**Radicado → Resolución por empresa y trámite ({unidad.lower()} promedio)**")
+        st.markdown(f"**Radicado → Auto → Resolución, por empresa ({unidad.lower()} promedio)**")
         comp = pd.concat([res_u, res_p, res_c])
-        comp = comp.assign(valor=comp["dias_radicado_resolucion"] / divisor, Trámite=comp["Categoría Trámite"])
+        comp = comp.assign(
+            total=comp["dias_radicado_resolucion"] / divisor,
+            hasta_auto=(comp["dias_radicado_auto"] / divisor),
+            Trámite=comp["Categoría Trámite"],
+        )
         comp["Empresa"] = comp["_titular_clave"].map(comp.groupby("_titular_clave")["Titular"].first())
         por_empresa = (
             comp.groupby(["Empresa", "Trámite"], as_index=False)
-            .agg(promedio=("valor", "mean"), casos=("valor", "count"),
+            .agg(promedio=("total", "mean"), hasta_auto=("hasta_auto", "mean"), casos=("total", "count"),
                  unergy=("es_unergy", "any"), energia=("es_energia", "any"))
         )
         por_empresa["etiqueta"] = por_empresa.apply(
@@ -220,55 +231,53 @@ def seccion_pares(limpio: pd.DataFrame, unidad: str) -> None:
         orden = por_empresa.sort_values("promedio")["Fila"].tolist()
         energia = set(por_empresa.loc[por_empresa["energia"], "Fila"])
         unergy_nombres = set(por_empresa.loc[por_empresa["unergy"], "Fila"])
+
+        # formato largo: dos tramos por barra
+        corto = {"Aprovechamiento forestal": "Forestal", "Ocupación de cauce": "Cauce"}
+        tramos = []
+        for _, r in por_empresa.iterrows():
+            auto = r["hasta_auto"] if pd.notna(r["hasta_auto"]) else None
+            partes = ([("radicado → auto", auto), ("auto → resolución", r["promedio"] - auto)] if auto is not None
+                      else [("sin fecha de auto", r["promedio"])])
+            for orden_t, (nombre, valor) in enumerate(partes):
+                tramos.append({**r.to_dict(), "Tramo": f"{corto[r['Trámite']]}: {nombre}",
+                               "valor": max(valor, 0), "orden_t": orden_t, "dias_tramo": valor})
+        tramos = pd.DataFrame(tramos)
+        dominio = ["Forestal: radicado → auto", "Forestal: auto → resolución",
+                   "Cauce: radicado → auto", "Cauce: auto → resolución",
+                   "Forestal: sin fecha de auto", "Cauce: sin fecha de auto"]
+        colores = ["#a3c76d", "#4d7c0f", "#93c5fd", "#2563eb", "#9ca3af", "#9ca3af"]
+        presentes = [d for d in dominio if d in set(tramos["Tramo"])]
+        escala = alt.Scale(domain=presentes, range=[colores[dominio.index(d)] for d in presentes])
+
         lista = lambda nombres: "[" + ",".join(repr(x) for x in nombres) + "]"
         color_label = (f"indexof({lista(unergy_nombres)}, datum.value) >= 0 ? '{COLOR_ALERTA}' : "
                        f"indexof({lista(energia)}, datum.value) >= 0 ? '#0f172a' : '#64748b'")
         peso_label = f"indexof({lista(unergy_nombres | energia)}, datum.value) >= 0 ? 'bold' : 'normal'"
-        escala = alt.Scale(domain=["Aprovechamiento forestal", "Ocupación de cauce"], range=["#4d7c0f", "#2563eb"])
         eje_y = alt.Y("Fila:N", sort=orden, title=None,
                       scale=alt.Scale(paddingInner=0.35, paddingOuter=0.2),
                       axis=alt.Axis(labelLimit=420, labelOverlap=False, labelFontSize=12, ticks=False,
                                     domain=False, labelColor=alt.expr(color_label),
                                     labelFontWeight=alt.expr(peso_label)))
-        base = alt.Chart(por_empresa).encode(y=eje_y)
-        barras = base.mark_bar(cornerRadiusEnd=4).encode(
-            x=alt.X("promedio:Q", title=unidad, axis=alt.Axis(grid=False)),
-            color=alt.Color("Trámite:N", scale=escala, legend=alt.Legend(orient="top", title=None)),
-            stroke=alt.condition("datum.unergy", alt.value(COLOR_ALERTA), alt.value(None)),
-            strokeWidth=alt.condition("datum.unergy", alt.value(3), alt.value(0)),
-            tooltip=["Empresa", "Trámite", alt.Tooltip("promedio:Q", title=f"Promedio ({unidad.lower()})", format=".0f"),
+        barras = alt.Chart(tramos).mark_bar().encode(
+            y=eje_y,
+            x=alt.X("sum(valor):Q", title=unidad, axis=alt.Axis(grid=False)),
+            color=alt.Color("Tramo:N", scale=escala, legend=alt.Legend(orient="top", title=None, columns=2)),
+            order=alt.Order("orden_t:Q"),
+            tooltip=[alt.Tooltip("Empresa:N"), alt.Tooltip("Tramo:N"),
+                     alt.Tooltip("dias_tramo:Q", title=f"{unidad} del tramo", format=".0f"),
+                     alt.Tooltip("promedio:Q", title=f"{unidad} en total", format=".0f"),
                      alt.Tooltip("casos:Q", title="Trámites")],
         )
-        textos = base.mark_text(align="left", dx=5, fontSize=11, color="#334155").encode(
-            x="promedio:Q", text="etiqueta:N")
-        alto = 36 * len(por_empresa) + 40
-        st.altair_chart((barras + textos).properties(height=alto), width="stretch")
-        st.caption("Verde = aprovechamiento forestal · azul = ocupación de cauce. "
-                   "Nombre en rojo = Unergy (barra con borde rojo); en negrita = empresas de energía.")
-
-        # --- Por etapa: dónde se pierde el tiempo ---
-        st.divider()
-        st.markdown(f"**¿En qué etapa se va el tiempo? ({unidad.lower()} promedio)**")
-        etapas = {"dias_radicado_auto": "1. Radicado → Auto", "dias_auto_visita": "2. Auto → Visita",
-                  "dias_visita_resolucion": "3. Visita → Resolución"}
-        filas = []
-        escala = alt.Scale(domain=["Unergy", "Demás empresas"], range=[COLOR_ALERTA, "#94a3b8"])
-        for nombre, datos in (("Unergy", unergy), ("Demás empresas", pares)):
-            for col, etiqueta in etapas.items():
-                serie = datos[col].dropna()
-                if len(serie):
-                    filas.append({"Grupo": nombre, "Etapa": etiqueta, "valor": serie.mean() / divisor, "n": len(serie)})
-        if filas:
-            df_etapas = pd.DataFrame(filas)
-            graf = alt.Chart(df_etapas).mark_bar(cornerRadiusEnd=4).encode(
-                y=alt.Y("Grupo:N", title=None, sort=["Unergy", "Demás empresas"]),
-                x=alt.X("valor:Q", title=unidad),
-                color=alt.Color("Grupo:N", scale=escala, legend=None),
-                row=alt.Row("Etapa:N", title=None, header=alt.Header(labelAngle=0, labelAlign="left")),
-                tooltip=["Grupo", "Etapa", alt.Tooltip("valor:Q", format=".0f", title=unidad), "n"],
-            ).properties(height=60)
-            st.altair_chart(graf, width="stretch")
-            st.caption("Cada etapa usa los trámites que tienen esas dos fechas, aunque no estén resueltos todavía.")
+        borde_unergy = alt.Chart(por_empresa[por_empresa["unergy"]]).mark_bar(
+            fill=None, stroke=COLOR_ALERTA, strokeWidth=3).encode(y=eje_y, x="promedio:Q")
+        textos = alt.Chart(por_empresa).mark_text(align="left", dx=5, fontSize=11, color="#334155").encode(
+            y=eje_y, x="promedio:Q", text="etiqueta:N")
+        st.altair_chart((barras + borde_unergy + textos).properties(height=36 * len(por_empresa) + 60),
+                        width="stretch")
+        st.caption("Cada barra es el total de radicado a resolución. El tramo claro es hasta el auto de inicio "
+                   "y el oscuro, del auto a la resolución. Verde = aprovechamiento forestal, azul = ocupación de cauce. "
+                   "Nombre en rojo = Unergy; en negrita = empresas de energía.")
 
         # --- Trámites de pares en curso ---
         en_curso = pares[pares["Fecha resolución"].isna() & pares["Fecha radicado inicio trámite"].notna()]
