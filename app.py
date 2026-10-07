@@ -36,6 +36,47 @@ def normalizar_titular(t):
     return t.rstrip(",").strip()
 
 
+def unir_actos_en_tramites(df: pd.DataFrame) -> pd.DataFrame:
+    """El Excel tiene una fila por ACTO (auto, resolución...), así que un mismo trámite
+    puede aparecer varias veces. Para no contarlo doble:
+
+    1. Filas con las mismas fechas (radicado, auto, visita, resolución) del mismo titular
+       y categoría son el mismo trámite: se dejan en una sola fila.
+    2. Un auto sin resolución cuyo radicado y fecha de auto coinciden con un trámite ya
+       resuelto es el auto de ESE trámite: se quita (uno por cada resolución).
+    No se unen trámites distintos aunque se hayan radicado el mismo día (Unergy radica
+    varios proyectos a la vez y el Excel no trae el número de expediente).
+    """
+    df = df.copy()
+    fechas = [c for c in COLUMNAS_FECHA if c in df.columns]
+    df["_k_tit"] = df["_titular_clave"].fillna("") + "|" + df["Categoría Trámite"].fillna("")
+    clave_completa = ["_k_tit"] + fechas
+    archivos = (df.assign(_a=df["Archivo"].fillna("").astype(str))
+                .groupby(clave_completa, dropna=False)["_a"]
+                .agg(lambda s: " + ".join(x for x in s if x)))
+    tipos = (df.assign(_t=df["Tipo"].fillna("").astype(str))
+             .groupby(clave_completa, dropna=False)["_t"]
+             .agg(lambda s: " + ".join(sorted(set(x for x in s if x)))))
+    # resoluciones sin fecha de resolución: casi siempre la fecha quedó en otra columna
+    df["_revisar"] = df["Tipo"].astype(str).str.lower().str.startswith("resol") & df["Fecha resolución"].isna()
+    unidos = df.drop_duplicates(subset=clave_completa).copy()
+    idx = pd.MultiIndex.from_frame(unidos[clave_completa])
+    unidos["Archivo"] = archivos.reindex(idx).values
+    unidos["Tipo"] = tipos.reindex(idx).values
+
+    resueltos = unidos[unidos["Fecha resolución"].notna()]
+    clave_auto = ["_k_tit", "Fecha radicado inicio trámite", "Fecha auto"]
+    cupo = resueltos.groupby(clave_auto, dropna=True).size().to_dict()
+    quitar = []
+    for i, fila in unidos[unidos["Fecha resolución"].isna() & ~unidos["_revisar"]].iterrows():
+        k = tuple(fila[c] for c in clave_auto)
+        if cupo.get(k, 0) > 0:
+            cupo[k] -= 1
+            quitar.append(i)
+    unidos = unidos.drop(index=quitar).drop(columns=["_k_tit"])
+    return unidos.reset_index(drop=True)
+
+
 @st.cache_data(show_spinner=False)
 def cargar_datos(contenido: bytes) -> pd.DataFrame:
     df = pd.read_excel(pd.io.common.BytesIO(contenido))
@@ -56,6 +97,8 @@ def cargar_datos(contenido: bytes) -> pd.DataFrame:
         df["_titular_clave"].str.replace(r"[.,]", " ", regex=True)
         .str.replace(r"\s+", " ", regex=True).str.strip()
     )
+
+    df = unir_actos_en_tramites(df)
 
     df["dias_radicado_auto"] = (df["Fecha auto"] - df["Fecha radicado inicio trámite"]).dt.days
     df["dias_auto_visita"] = (df["Fecha visita"] - df["Fecha auto"]).dt.days
@@ -276,6 +319,14 @@ def main() -> None:
 
     if base["_anomalia"].sum():
         st.caption(f"⚠️ {int(base['_anomalia'].sum())} trámite(s) con fechas inconsistentes se excluyen de los promedios")
+
+    por_revisar = base[base["_revisar"]]
+    if not por_revisar.empty:
+        with st.expander(f"⚠️ {len(por_revisar)} resolución(es) sin 'Fecha resolución' en el Excel — revisar"):
+            st.caption("Son filas de tipo Resolución sin fecha de resolución; no entran en los promedios. "
+                       "Muchas veces la fecha quedó en otra columna.")
+            st.dataframe(por_revisar[["Titular", "Archivo", "Fecha radicado inicio trámite", "Fecha auto",
+                                      "Fecha resolución"]], hide_index=True, width="stretch")
 
     unidad = st.segmented_control("Unidad", ["Días", "Meses"], default="Días", label_visibility="collapsed")
     unidad = unidad or "Días"
