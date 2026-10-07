@@ -342,6 +342,46 @@ def seccion_pares(limpio: pd.DataFrame, unidad: str, personas: pd.DataFrame | No
                              width="stretch", hide_index=True)
 
 
+COLORES_CAR = ["#15803d", "#1d4ed8", "#b45309", "#7c3aed", "#be123c", "#0e7490"]
+
+
+def logo_de(car: str) -> str | None:
+    """Logo de la CAR: primero logos/<CAR>.png en el repo (sin tilde), luego la URL conocida."""
+    for nombre in {car, quitar_acentos(car)}:
+        for ext in ("png", "jpg", "jpeg", "svg", "webp"):
+            ruta = os.path.join(os.path.dirname(__file__), "logos", f"{nombre}.{ext}")
+            if os.path.exists(ruta):
+                return ruta
+    return LOGOS_CAR.get(car)
+
+
+def insignia(car: str, color: str) -> str:
+    """Círculo con las iniciales, para la CAR que todavía no tiene logo."""
+    letras = re.sub(r"^CORPO", "", quitar_acentos(car))[:2] or car[:2]
+    return (f"<div style='width:44px;height:44px;border-radius:50%;background:{color};color:white;"
+            f"display:flex;align-items:center;justify-content:center;font-weight:700;font-size:15px'>{letras}</div>")
+
+
+def selector_car(cars: list[str]) -> str:
+    """Un botón por CAR, con su logo, en la barra lateral."""
+    if st.session_state.get("car_sel") not in cars:
+        st.session_state["car_sel"] = cars[0]
+    st.markdown("**Corporación**")
+    for i, car in enumerate(cars):
+        c_logo, c_boton = st.columns([1, 3], vertical_alignment="center")
+        ruta = logo_de(car)
+        if ruta:
+            c_logo.image(ruta, width=44)
+        else:
+            c_logo.markdown(insignia(car, COLORES_CAR[i % len(COLORES_CAR)]), unsafe_allow_html=True)
+        activo = st.session_state["car_sel"] == car
+        if c_boton.button(car, key=f"car_{car}", type="primary" if activo else "secondary", width="stretch"):
+            st.session_state["car_sel"] = car
+            st.rerun()
+    st.divider()
+    return st.session_state["car_sel"]
+
+
 def main() -> None:
     col_logo, col_titulo = st.columns([1, 6])
     logo, titulo = col_logo.empty(), col_titulo.empty()
@@ -364,15 +404,16 @@ def main() -> None:
 
     with st.sidebar:
         st.header("Filtros")
-        car_sel = st.radio("CAR", cars, horizontal=False) if len(cars) > 1 else cars[0]
+        car_sel = selector_car(cars)
         solo_empresas = st.checkbox("Solo empresas / entidades", value=True)
         categorias_validas = ["Aprovechamiento forestal", "Ocupación de cauce"]
         cat_sel = [c for c in categorias_validas if st.checkbox(c, value=True)]
 
     df = df[df["CAR"] == car_sel]
     titulo.title(f"Tiempos de trámite — {car_sel}")
-    if LOGOS_CAR.get(car_sel):
-        logo.image(LOGOS_CAR[car_sel], width=90)
+    ruta_logo = logo_de(car_sel)
+    if ruta_logo:
+        logo.image(ruta_logo, width=90)
 
     base = df[df["Categoría Trámite"].isin(cat_sel)]
     if solo_empresas:
