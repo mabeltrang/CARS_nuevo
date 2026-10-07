@@ -159,7 +159,7 @@ def fila_de_circulos(items: list[tuple[str, str, str]]) -> None:
 
 
 
-def seccion_pares(limpio: pd.DataFrame, unidad: str) -> None:
+def seccion_pares(limpio: pd.DataFrame, unidad: str, personas: pd.DataFrame | None = None) -> None:
     """Compara a Unergy contra un grupo de pares, con la misma modalidad de trámite."""
     divisor = 30 if unidad == "Meses" else 1
     empresas = limpio[(limpio["Tipo de persona"] == "Empresa / Entidad") & ~limpio["es_publica"]]
@@ -180,6 +180,12 @@ def seccion_pares(limpio: pd.DataFrame, unidad: str) -> None:
         if misma_modalidad and modalidades_unergy:
             pares = pares[pares["Tipo de aprovechamiento"].isin(modalidades_unergy)]
             unergy = unergy[unergy["Tipo de aprovechamiento"].isin(modalidades_unergy)]
+
+        personas = personas if personas is not None else limpio.iloc[0:0]
+        if misma_modalidad and modalidades_unergy:
+            personas = personas[(personas["Categoría Trámite"] != "Aprovechamiento forestal")
+                                | personas["Tipo de aprovechamiento"].isin(modalidades_unergy)]
+        res_n = personas[personas["dias_radicado_resolucion"].notna()]
 
         res_u = unergy[unergy["dias_radicado_resolucion"].notna()]
         res_p = pares[pares["dias_radicado_resolucion"].notna()]
@@ -209,28 +215,35 @@ def seccion_pares(limpio: pd.DataFrame, unidad: str) -> None:
         # --- Por empresa: barra partida en radicado→auto y auto→resolución ---
         st.divider()
         st.markdown(f"**Radicado → Auto → Resolución, por empresa ({unidad.lower()} promedio)**")
-        comp = pd.concat([res_u, res_p, res_c])
+        NOMBRE_PERSONAS = "PERSONAS NATURALES (promedio)"
+        comp = pd.concat([res_u, res_p, res_c, res_n.assign(_es_persona=True)])
+        comp["_es_persona"] = comp["_es_persona"].fillna(False).astype(bool)
         comp = comp.assign(
             total=comp["dias_radicado_resolucion"] / divisor,
             hasta_auto=(comp["dias_radicado_auto"] / divisor),
+            hasta_visita=((comp["Fecha visita"] - comp["Fecha radicado inicio trámite"]).dt.days / divisor),
             Trámite=comp["Categoría Trámite"],
         )
         comp["Empresa"] = comp["_titular_clave"].map(comp.groupby("_titular_clave")["Titular"].first())
+        comp.loc[comp["_es_persona"], "Empresa"] = NOMBRE_PERSONAS
         por_empresa = (
             comp.groupby(["Empresa", "Trámite"], as_index=False)
             .agg(promedio=("total", "mean"), hasta_auto=("hasta_auto", "mean"), casos=("total", "count"),
-                 unergy=("es_unergy", "any"), energia=("es_energia", "any"))
+                 hasta_visita=("hasta_visita", "mean"), n_visita=("hasta_visita", "count"),
+                 unergy=("es_unergy", "any"), energia=("es_energia", "any"), persona=("_es_persona", "any"))
         )
         por_empresa["etiqueta"] = por_empresa.apply(
-            lambda r: f"{r['promedio']:.0f}" + (f"  ({r['casos']} casos)" if r["casos"] > 1 else ""), axis=1)
+            lambda r: f"{r['promedio']:.0f}" + (f"  ({r['casos']} casos)" if r["casos"] > 1
+                                                 else "  (1 caso)" if r["persona"] else ""), axis=1)
         # una fila por empresa y trámite; si una empresa tiene los dos, la de cauce lleva "(cauce)"
         dobles = set(por_empresa["Empresa"][por_empresa["Empresa"].duplicated()])
         por_empresa["Fila"] = por_empresa.apply(
             lambda r: r["Empresa"] + ("  (cauce)" if r["Empresa"] in dobles and r["Trámite"] == "Ocupación de cauce" else ""),
             axis=1)
         orden = por_empresa.sort_values("promedio")["Fila"].tolist()
-        energia = set(por_empresa.loc[por_empresa["energia"], "Fila"])
+        energia = set(por_empresa.loc[por_empresa["energia"] & ~por_empresa["persona"], "Fila"])
         unergy_nombres = set(por_empresa.loc[por_empresa["unergy"], "Fila"])
+        personas_nombres = set(por_empresa.loc[por_empresa["persona"], "Fila"])
 
         # formato largo: dos tramos por barra
         corto = {"Aprovechamiento forestal": "Forestal", "Ocupación de cauce": "Cauce"}
@@ -252,8 +265,9 @@ def seccion_pares(limpio: pd.DataFrame, unidad: str) -> None:
 
         lista = lambda nombres: "[" + ",".join(repr(x) for x in nombres) + "]"
         color_label = (f"indexof({lista(unergy_nombres)}, datum.value) >= 0 ? '{COLOR_ALERTA}' : "
+                       f"indexof({lista(personas_nombres)}, datum.value) >= 0 ? '#7c3aed' : "
                        f"indexof({lista(energia)}, datum.value) >= 0 ? '#0f172a' : '#64748b'")
-        peso_label = f"indexof({lista(unergy_nombres | energia)}, datum.value) >= 0 ? 'bold' : 'normal'"
+        peso_label = f"indexof({lista(unergy_nombres | energia | personas_nombres)}, datum.value) >= 0 ? 'bold' : 'normal'"
         eje_y = alt.Y("Fila:N", sort=orden, title=None,
                       scale=alt.Scale(paddingInner=0.35, paddingOuter=0.2),
                       axis=alt.Axis(labelLimit=420, labelOverlap=False, labelFontSize=12, ticks=False,
@@ -271,13 +285,20 @@ def seccion_pares(limpio: pd.DataFrame, unidad: str) -> None:
         )
         borde_unergy = alt.Chart(por_empresa[por_empresa["unergy"]]).mark_bar(
             fill=None, stroke=COLOR_ALERTA, strokeWidth=3).encode(y=eje_y, x="promedio:Q")
+        visitas = por_empresa[por_empresa["n_visita"] > 0]
+        rayita = alt.Chart(visitas).mark_tick(color="#111827", thickness=3, size=26).encode(
+            y=eje_y, x="hasta_visita:Q",
+            tooltip=["Empresa", alt.Tooltip("hasta_visita:Q", title=f"{unidad} de radicado a visita", format=".0f"),
+                     alt.Tooltip("n_visita:Q", title="Trámites con fecha de visita")],
+        )
         textos = alt.Chart(por_empresa).mark_text(align="left", dx=5, fontSize=11, color="#334155").encode(
             y=eje_y, x="promedio:Q", text="etiqueta:N")
-        st.altair_chart((barras + borde_unergy + textos).properties(height=36 * len(por_empresa) + 60),
+        st.altair_chart((barras + borde_unergy + rayita + textos).properties(height=36 * len(por_empresa) + 60),
                         width="stretch")
         st.caption("Cada barra es el total de radicado a resolución. El tramo claro es hasta el auto de inicio "
                    "y el oscuro, del auto a la resolución. Verde = aprovechamiento forestal, azul = ocupación de cauce. "
-                   "Nombre en rojo = Unergy; en negrita = empresas de energía.")
+                   "Nombre en rojo = Unergy; en negrita = empresas de energía; en morado = promedio de personas naturales. "
+                   "La rayita negra marca, en promedio, cuándo fue la visita (solo donde el Excel tiene fecha de visita).")
 
         # --- Trámites de pares en curso ---
         en_curso = pares[pares["Fecha resolución"].isna() & pares["Fecha radicado inicio trámite"].notna()]
@@ -374,7 +395,10 @@ def main() -> None:
     )
 
     with tab_pares:
-        seccion_pares(limpio, unidad)
+        # personas naturales como referencia, aunque el filtro "Solo empresas" esté activo
+        personas = df[df["Categoría Trámite"].isin(cat_sel) & (df["Tipo de persona"] == "Persona natural")
+                      & ~df["_anomalia"]]
+        seccion_pares(limpio, unidad, personas)
 
     with tab_ranking:
         with st.container(border=True):
