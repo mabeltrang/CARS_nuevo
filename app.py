@@ -123,69 +123,85 @@ def seccion_pares(limpio: pd.DataFrame, unidad: str) -> None:
 
     with st.container(border=True):
         st.subheader("¿Cuánto se demora Unergy frente a las demás empresas?")
-        unergy = empresas[empresas["es_unergy"]]
+        forestal_todo = empresas[empresas["Categoría Trámite"] == "Aprovechamiento forestal"]
+        cauce = empresas[empresas["Categoría Trámite"] == "Ocupación de cauce"]
+        unergy = forestal_todo[forestal_todo["es_unergy"]]
         modalidades_unergy = sorted(unergy["Tipo de aprovechamiento"].dropna().unique())
         misma_modalidad = st.checkbox(
-            f"Comparar solo la misma modalidad de Unergy ({', '.join(modalidades_unergy) or '—'})",
+            f"En aprovechamiento forestal, comparar solo la modalidad de Unergy ({', '.join(modalidades_unergy) or '—'})",
             value=bool(modalidades_unergy),
-            help="Un aprovechamiento Único tarda mucho más que uno Aislado: compararlos juntos no es justo.",
+            help="Un aprovechamiento Único tarda mucho más que uno Aislado: compararlos juntos no es justo. "
+                 "No afecta a ocupación de cauce.",
         )
-        pares = empresas[~empresas["es_unergy"]]
+        pares = forestal_todo[~forestal_todo["es_unergy"]]
         if misma_modalidad and modalidades_unergy:
             pares = pares[pares["Tipo de aprovechamiento"].isin(modalidades_unergy)]
             unergy = unergy[unergy["Tipo de aprovechamiento"].isin(modalidades_unergy)]
 
         res_u = unergy[unergy["dias_radicado_resolucion"].notna()]
         res_p = pares[pares["dias_radicado_resolucion"].notna()]
-        if res_u.empty or res_p.empty:
-            st.info("No hay trámites resueltos suficientes para comparar. Desmarca 'misma modalidad'.")
+        res_c = cauce[cauce["dias_radicado_resolucion"].notna()]
+        if res_u.empty and res_p.empty and res_c.empty:
+            st.info("No hay trámites resueltos para comparar.")
             return
         res_e = res_p[res_p["es_energia"]]
 
-        # --- Resumen: tres números ---
-        dias = lambda d: d["dias_radicado_resolucion"].mean()
+        # --- Resumen (aprovechamiento forestal, que es el trámite de Unergy) ---
+        dias = lambda d: formatear_dias(d["dias_radicado_resolucion"].mean(), unidad) if len(d) else "—"
         fila_de_circulos([
-            (formatear_dias(dias(res_u), unidad), f"Unergy (n={len(res_u)})", COLOR_ALERTA),
-            (formatear_dias(dias(res_e), unidad) if len(res_e) else "—",
-             f"Empresas de energía (n={len(res_e)})", "#475569"),
-            (formatear_dias(dias(res_p), unidad), f"Todas las empresas privadas (n={len(res_p)})", "#94a3b8"),
+            (dias(res_u), f"Unergy (n={len(res_u)})", COLOR_ALERTA),
+            (dias(res_e), f"Empresas de energía (n={len(res_e)})", "#475569"),
+            (dias(res_p), f"Todas las empresas privadas (n={len(res_p)})", "#94a3b8"),
         ])
-        st.caption(f"Promedio de {unidad.lower()} entre el radicado y la resolución. "
+        st.caption(f"Aprovechamiento forestal: promedio de {unidad.lower()} entre el radicado y la resolución. "
                    "n = número de trámites resueltos.")
 
-        # --- Por empresa ---
+        # --- Por empresa, forestal y cauce en el mismo gráfico ---
         st.divider()
-        st.markdown(f"**Radicado → Resolución por empresa ({unidad.lower()} promedio)**")
-        comp = pd.concat([res_u, res_p])
-        comp = comp.assign(
-            valor=comp["dias_radicado_resolucion"] / divisor,
-            Grupo=comp["es_unergy"].map({True: "Unergy", False: None}).fillna(
-                comp["es_energia"].map({True: "Empresas de energía", False: "Otras empresas"})),
-        )
+        st.markdown(f"**Radicado → Resolución por empresa y trámite ({unidad.lower()} promedio)**")
+        comp = pd.concat([res_u, res_p, res_c])
+        comp = comp.assign(valor=comp["dias_radicado_resolucion"] / divisor, Trámite=comp["Categoría Trámite"])
         comp["Empresa"] = comp["_titular_clave"].map(comp.groupby("_titular_clave")["Titular"].first())
         por_empresa = (
-            comp.groupby(["Empresa", "Grupo"], as_index=False)
-            .agg(promedio=("valor", "mean"), casos=("valor", "count"))
-            .sort_values("promedio")
+            comp.groupby(["Empresa", "Trámite"], as_index=False)
+            .agg(promedio=("valor", "mean"), casos=("valor", "count"),
+                 unergy=("es_unergy", "any"), energia=("es_energia", "any"))
         )
         por_empresa["etiqueta"] = por_empresa.apply(
             lambda r: f"{r['promedio']:.0f}" + (f"  ({r['casos']} casos)" if r["casos"] > 1 else ""), axis=1)
-        orden = por_empresa["Empresa"].tolist()
-        escala = alt.Scale(domain=["Unergy", "Empresas de energía", "Otras empresas"],
-                           range=[COLOR_ALERTA, "#475569", "#cbd5e1"])
-        eje_y = alt.Y("Empresa:N", sort=orden, title=None,
+        # una fila por empresa y trámite; si una empresa tiene los dos, la de cauce lleva "(cauce)"
+        dobles = set(por_empresa["Empresa"][por_empresa["Empresa"].duplicated()])
+        por_empresa["Fila"] = por_empresa.apply(
+            lambda r: r["Empresa"] + ("  (cauce)" if r["Empresa"] in dobles and r["Trámite"] == "Ocupación de cauce" else ""),
+            axis=1)
+        orden = por_empresa.sort_values("promedio")["Fila"].tolist()
+        energia = set(por_empresa.loc[por_empresa["energia"], "Fila"])
+        unergy_nombres = set(por_empresa.loc[por_empresa["unergy"], "Fila"])
+        lista = lambda nombres: "[" + ",".join(repr(x) for x in nombres) + "]"
+        color_label = (f"indexof({lista(unergy_nombres)}, datum.value) >= 0 ? '{COLOR_ALERTA}' : "
+                       f"indexof({lista(energia)}, datum.value) >= 0 ? '#0f172a' : '#64748b'")
+        peso_label = f"indexof({lista(unergy_nombres | energia)}, datum.value) >= 0 ? 'bold' : 'normal'"
+        escala = alt.Scale(domain=["Aprovechamiento forestal", "Ocupación de cauce"], range=["#4d7c0f", "#2563eb"])
+        eje_y = alt.Y("Fila:N", sort=orden, title=None,
                       scale=alt.Scale(paddingInner=0.35, paddingOuter=0.2),
-                      axis=alt.Axis(labelLimit=420, labelOverlap=False, labelFontSize=12, ticks=False, domain=False))
+                      axis=alt.Axis(labelLimit=420, labelOverlap=False, labelFontSize=12, ticks=False,
+                                    domain=False, labelColor=alt.expr(color_label),
+                                    labelFontWeight=alt.expr(peso_label)))
         base = alt.Chart(por_empresa).encode(y=eje_y)
         barras = base.mark_bar(cornerRadiusEnd=4).encode(
             x=alt.X("promedio:Q", title=unidad, axis=alt.Axis(grid=False)),
-            color=alt.Color("Grupo:N", scale=escala, legend=alt.Legend(orient="top", title=None)),
-            tooltip=["Empresa", alt.Tooltip("promedio:Q", title=f"Promedio ({unidad.lower()})", format=".0f"),
+            color=alt.Color("Trámite:N", scale=escala, legend=alt.Legend(orient="top", title=None)),
+            stroke=alt.condition("datum.unergy", alt.value(COLOR_ALERTA), alt.value(None)),
+            strokeWidth=alt.condition("datum.unergy", alt.value(3), alt.value(0)),
+            tooltip=["Empresa", "Trámite", alt.Tooltip("promedio:Q", title=f"Promedio ({unidad.lower()})", format=".0f"),
                      alt.Tooltip("casos:Q", title="Trámites")],
         )
-        textos = base.mark_text(align="left", dx=5, fontSize=12, color="#334155").encode(
+        textos = base.mark_text(align="left", dx=5, fontSize=11, color="#334155").encode(
             x="promedio:Q", text="etiqueta:N")
-        st.altair_chart((barras + textos).properties(height=36 * len(orden) + 40), width="stretch")
+        alto = 36 * len(por_empresa) + 40
+        st.altair_chart((barras + textos).properties(height=alto), width="stretch")
+        st.caption("Verde = aprovechamiento forestal · azul = ocupación de cauce. "
+                   "Nombre en rojo = Unergy (barra con borde rojo); en negrita = empresas de energía.")
 
         # --- Por etapa: dónde se pierde el tiempo ---
         st.divider()
