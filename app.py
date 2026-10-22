@@ -190,11 +190,8 @@ COLOR_POCOS_DATOS = "#9ca3af"
 MIN_CASOS = 3
 COLORES_ETAPA = {
     "Radicado → Auto": "#a7d7b8",
-    "Auto → Visita": "#4fb07a",
-    "Visita → Resolución": "#0b6b3a",
-    "Auto → Resolución": "#2f8f5b",
-    "Radicado → Resolución": "#2f8f5b",
-    "En curso (sin resolución)": "#d1d5db",
+    "Auto → Resolución": "#1f7a4a",
+    "Sin fecha de auto": "#9ca3af",
 }
 
 
@@ -209,69 +206,55 @@ def circulo_mediana(serie: pd.Series, etiqueta: str, unidad: str) -> tuple[str, 
     return formatear_dias(serie.median(), unidad), f"{etiqueta}<br>(n={n}{nota})", color
 
 
-def tramos_de_tramite(fila: pd.Series, hoy: pd.Timestamp) -> list[tuple[str, int, int]]:
-    """Etapas de un trámite como (nombre, día de inicio, día de fin), contando desde el radicado."""
-    radicado = fila["Fecha radicado inicio trámite"]
-    hitos = [(nombre, fila[col]) for nombre, col in
-             [("Radicado", "Fecha radicado inicio trámite"), ("Auto", "Fecha auto"),
-              ("Visita", "Fecha visita"), ("Resolución", "Fecha resolución")]
-             if pd.notna(fila[col])]
-    tramos = []
-    for (n1, f1), (n2, f2) in zip(hitos, hitos[1:]):
-        tramos.append((f"{n1} → {n2}", (f1 - radicado).days, (f2 - radicado).days))
-    if pd.isna(fila["Fecha resolución"]):
-        ultimo = hitos[-1][1]
-        tramos.append(("En curso (sin resolución)", (ultimo - radicado).days, (hoy - radicado).days))
-    return tramos
-
-
-def linea_de_tiempo(df: pd.DataFrame, unidad: str, maximo: int = 40) -> None:
-    """Una barra por trámite, partida en sus etapas, alineadas en el radicado."""
-    hoy = pd.Timestamp.today().normalize()
-    con_radicado = df[df["Fecha radicado inicio trámite"].notna()]
-    if con_radicado.empty:
-        st.info("No hay trámites con fecha de radicado en este filtro.")
+def tiempos_por_empresa(df: pd.DataFrame, unidad: str, maximo: int = 40) -> None:
+    """Una barra por empresa y modalidad: promedio de radicado → auto → resolución de sus trámites resueltos."""
+    resueltos = df[df["dias_radicado_resolucion"].notna()].copy()
+    if resueltos.empty:
+        st.info("Todavía no hay trámites resueltos en este filtro.")
         return
-    if len(con_radicado) > maximo:
-        con_radicado = con_radicado.sort_values("Fecha radicado inicio trámite", ascending=False).head(maximo)
-        st.caption(f"Se muestran los {maximo} trámites radicados más recientemente.")
-
     divisor = 30 if unidad == "Meses" else 1
-    filas = []
-    for i, (_, r) in enumerate(con_radicado.iterrows()):
-        modalidad = r["Tipo de aprovechamiento"] if pd.notna(r["Tipo de aprovechamiento"]) else r["Categoría Trámite"]
-        nombre = f"{r['Titular']} · {modalidad} · {r['Fecha radicado inicio trámite']:%Y-%m}"
-        tramos = tramos_de_tramite(r, hoy)
-        total = tramos[-1][2] if tramos else 0
-        for etapa, desde, hasta in tramos:
-            filas.append({"id": i, "Trámite": nombre, "Etapa": etapa, "desde": desde / divisor,
-                          "hasta": hasta / divisor, "duracion": (hasta - desde) / divisor, "total": total / divisor})
-    if not filas:
-        st.info("Los trámites de este filtro solo tienen fecha de radicado.")
-        return
+    resueltos["Modalidad"] = resueltos["Tipo de aprovechamiento"].fillna(resueltos["Categoría Trámite"])
+    en_curso = (df[df["Fecha resolución"].isna() & df["Fecha radicado inicio trámite"].notna()]
+                .assign(Modalidad=lambda d: d["Tipo de aprovechamiento"].fillna(d["Categoría Trámite"]))
+                .groupby(["Titular", "Modalidad"]).size())
 
+    grupos = (resueltos.groupby(["Titular", "Modalidad"])
+              .agg(total=("dias_radicado_resolucion", "mean"), hasta_auto=("dias_radicado_auto", "mean"),
+                   n=("dias_radicado_resolucion", "count"))
+              .reset_index().sort_values("total", ascending=False).head(maximo))
+    filas = []
+    for _, g in grupos.iterrows():
+        pendientes = int(en_curso.get((g["Titular"], g["Modalidad"]), 0))
+        extra = f", {pendientes} en curso" if pendientes else ""
+        nombre = f"{g['Titular']} · {g['Modalidad']} (n={g['n']}{extra})"
+        total = g["total"] / divisor
+        if pd.notna(g["hasta_auto"]):
+            auto = min(g["hasta_auto"] / divisor, total)
+            filas += [{"Empresa": nombre, "Etapa": "Radicado → Auto", "desde": 0, "hasta": auto, "total": total},
+                      {"Empresa": nombre, "Etapa": "Auto → Resolución", "desde": auto, "hasta": total, "total": total}]
+        else:
+            filas.append({"Empresa": nombre, "Etapa": "Sin fecha de auto", "desde": 0, "hasta": total,
+                          "total": total})
     datos = pd.DataFrame(filas)
-    orden = (datos.groupby(["id", "Trámite"])["total"].max().reset_index()
-             .sort_values("total", ascending=False))
-    # nombres repetidos (mismo titular, modalidad y mes): se les agrega un número
-    orden["Trámite"] = orden["Trámite"] + orden.groupby("Trámite").cumcount().map(lambda k: f" ({k + 1})" if k else "")
-    datos = datos.drop(columns="Trámite").merge(orden[["id", "Trámite"]], on="id")
+    datos["duracion"] = datos["hasta"] - datos["desde"]
+    orden = list(dict.fromkeys(datos["Empresa"]))
 
     etapas = [e for e in COLORES_ETAPA if e in set(datos["Etapa"])]
-    grafico = alt.Chart(datos).mark_bar(height=16).encode(
-        y=alt.Y("Trámite:N", sort=orden["Trámite"].tolist(), title=None, axis=alt.Axis(labelLimit=380)),
-        x=alt.X("desde:Q", title=f"{unidad} desde el radicado"),
+    grafico = alt.Chart(datos).mark_bar(height=18).encode(
+        y=alt.Y("Empresa:N", sort=orden, title=None,
+                axis=alt.Axis(labelLimit=420, labelColor=alt.expr(
+                    f"indexof(upper(datum.value), 'UNERGY') >= 0 ? '{COLOR_ALERTA}' : '#4b5563'"))),
+        x=alt.X("desde:Q", title=f"{unidad} promedio desde el radicado"),
         x2="hasta:Q",
         color=alt.Color("Etapa:N", scale=alt.Scale(domain=etapas, range=[COLORES_ETAPA[e] for e in etapas]),
                         legend=alt.Legend(orient="bottom", title=None)),
-        tooltip=["Trámite", "Etapa", alt.Tooltip("duracion:Q", title=unidad, format=".0f"),
+        tooltip=["Empresa", "Etapa", alt.Tooltip("duracion:Q", title=unidad, format=".0f"),
                  alt.Tooltip("total:Q", title=f"{unidad} en total", format=".0f")],
     )
-    # altura fija por trámite: sin esto Streamlit aplasta las barras en una sola fila
-    alto_total = 40 * len(orden) + 110
-    st.altair_chart(grafico, width="stretch", height=alto_total)
-    st.caption("Cada barra es un trámite, desde su radicado. Si falta la visita, la barra pasa directo del auto "
-               "a la resolución. En gris, el tiempo que lleva sin resolver hasta hoy.")
+    # altura fija por fila: sin esto Streamlit aplasta las barras en una sola franja
+    st.altair_chart(grafico, width="stretch", height=40 * len(orden) + 110)
+    st.caption("Una barra por empresa y modalidad (Único, Aislado, Doméstico…), con el promedio de sus trámites "
+               "resueltos, sin importar el proyecto. n = trámites resueltos; Unergy en rojo.")
 
 
 
@@ -662,10 +645,10 @@ def main() -> None:
             st.caption(f"Calculado con los mismos {len(completos)} trámites, así que las etapas suman el total.")
         else:
             st.caption(f"Solo {len(completos)} trámite(s) tienen radicado, auto, visita y resolución: muy pocos "
-                       "para promediar por etapa. Mira cada trámite abajo.")
+                       "para promediar por etapa. Mira el tiempo por empresa abajo.")
 
-        with st.expander("Línea de tiempo de cada trámite", expanded=len(limpio) <= 20):
-            linea_de_tiempo(limpio, unidad)
+        with st.expander("Tiempo por empresa y modalidad", expanded=True):
+            tiempos_por_empresa(limpio, unidad)
 
     tab_pares, tab_buscar, tab_ranking, tab_tendencia, tab_detalle = st.tabs(
         ["Unergy vs. pares", "Buscar en la CAR", "Ranking de titulares", "Tendencia", "Detalle"]
