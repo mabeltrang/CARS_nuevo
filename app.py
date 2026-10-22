@@ -266,8 +266,10 @@ def linea_de_tiempo(df: pd.DataFrame, unidad: str, maximo: int = 40) -> None:
                         legend=alt.Legend(orient="bottom", title=None)),
         tooltip=["Trámite", "Etapa", alt.Tooltip("duracion:Q", title=unidad, format=".0f"),
                  alt.Tooltip("total:Q", title=f"{unidad} en total", format=".0f")],
-    ).properties(height=max(120, 28 * len(orden)))
-    st.altair_chart(grafico, width="stretch")
+    )
+    # altura fija por trámite: sin esto Streamlit aplasta las barras en una sola fila
+    alto_total = 40 * len(orden) + 110
+    st.altair_chart(grafico, width="stretch", height=alto_total)
     st.caption("Cada barra es un trámite, desde su radicado. Si falta la visita, la barra pasa directo del auto "
                "a la resolución. En gris, el tiempo que lleva sin resolver hasta hoy.")
 
